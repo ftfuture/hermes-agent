@@ -27,12 +27,15 @@ Usage::
         print(result["transcript"])
 """
 
+import json
 import logging
 import os
 import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -112,6 +115,16 @@ GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-lar
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
 _local_model_name: Optional[str] = None
+_local_lifecycle_lock = threading.RLock()
+_local_lifecycle_condition = threading.Condition(_local_lifecycle_lock)
+_local_inference_semaphores: dict[int, threading.BoundedSemaphore] = {}
+_local_last_used: Optional[float] = None
+_local_active_inferences = 0
+_monotonic = time.monotonic
+# ``os.add_dll_directory`` handles must stay alive for as long as delayed
+# CTranslate2 CUDA DLL loads can occur.
+_cuda_dll_directory_handles: list[object] = []
+_cuda_dll_directories: set[str] = set()
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -126,6 +139,75 @@ def _load_stt_config() -> dict:
         return load_config().get("stt") or {}
     except Exception:
         return {}
+
+
+def _configure_windows_cuda_dll_dirs() -> None:
+    """Register configured DLL directories for Windows CTranslate2 CUDA loads."""
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+
+    local_config = (_load_stt_config().get("local") or {})
+    configured = local_config.get("cuda_dll_dirs") or []
+    if isinstance(configured, str):
+        try:
+            parsed = json.loads(configured)
+            configured = parsed if isinstance(parsed, list) else [configured]
+        except (json.JSONDecodeError, TypeError):
+            configured = [configured]
+
+    for raw_path in configured:
+        dll_dir = Path(str(raw_path)).expanduser()
+        if not dll_dir.is_dir():
+            logger.warning("Ignoring missing STT CUDA DLL directory: %s", dll_dir)
+            continue
+        normalized = os.path.normcase(os.path.abspath(str(dll_dir))).casefold()
+        with _local_lifecycle_lock:
+            if normalized in _cuda_dll_directories:
+                continue
+            _cuda_dll_directory_handles.append(os.add_dll_directory(str(dll_dir)))
+            _cuda_dll_directories.add(normalized)
+
+
+def _positive_config_number(value: object, default: float, *, integer: bool = False):
+    try:
+        parsed = int(value) if integer else float(value)
+        if parsed <= 0:
+            raise ValueError
+        return parsed
+    except (TypeError, ValueError):
+        return int(default) if integer else default
+
+
+def _local_runtime_settings() -> tuple[float, int]:
+    local = (_load_stt_config().get("local") or {})
+    idle = _positive_config_number(local.get("idle_unload_seconds", 600), 600)
+    concurrency = _positive_config_number(local.get("max_concurrency", 1), 1, integer=True)
+    return idle, concurrency
+
+
+def _local_inference_semaphore(max_concurrency: int) -> threading.BoundedSemaphore:
+    with _local_lifecycle_lock:
+        return _local_inference_semaphores.setdefault(
+            max_concurrency, threading.BoundedSemaphore(max_concurrency)
+        )
+
+
+def cleanup_local_stt() -> None:
+    """Release the cached local model and retained Windows DLL directories."""
+    global _local_model, _local_model_name, _local_last_used
+    with _local_lifecycle_condition:
+        while _local_active_inferences:
+            _local_lifecycle_condition.wait()
+        _local_model = None
+        _local_model_name = None
+        _local_last_used = None
+        for handle in _cuda_dll_directory_handles:
+            try:
+                handle.close()
+            except Exception:
+                logger.debug("Failed to close STT CUDA DLL directory handle", exc_info=True)
+        _cuda_dll_directory_handles.clear()
+        _cuda_dll_directories.clear()
 
 
 def is_stt_enabled(stt_config: Optional[dict] = None) -> bool:
@@ -1118,6 +1200,7 @@ def _load_local_whisper_model(model_name: str):
     We try ``auto`` first (fast CUDA path when it works), and on any CUDA
     library load failure fall back to CPU + int8.
     """
+    _configure_windows_cuda_dll_dirs()
     from faster_whisper import WhisperModel
     try:
         return WhisperModel(model_name, device="auto", compute_type="auto")
@@ -1134,18 +1217,35 @@ def _load_local_whisper_model(model_name: str):
 
 def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
     """Transcribe using faster-whisper (local, free)."""
-    global _local_model, _local_model_name
+    global _local_model, _local_model_name, _local_last_used, _local_active_inferences
 
     if not _HAS_FASTER_WHISPER:
         if not _try_lazy_install_stt():
             return {"success": False, "transcript": "", "error": "faster-whisper not installed"}
 
+    reserved_inference = False
     try:
-        # Lazy-load the model (downloads on first use, ~150 MB for 'base')
-        if _local_model is None or _local_model_name != model_name:
-            logger.info("Loading faster-whisper model '%s' (first load downloads the model)...", model_name)
-            _local_model = _load_local_whisper_model(model_name)
-            _local_model_name = model_name
+        idle_unload_seconds, max_concurrency = _local_runtime_settings()
+        now = _monotonic()
+        # Lazy-load the model (downloads on first use, ~150 MB for 'base').
+        with _local_lifecycle_condition:
+            while _local_active_inferences and _local_model_name != model_name:
+                _local_lifecycle_condition.wait()
+            if (
+                _local_model is not None
+                and _local_active_inferences == 0
+                and _local_last_used is not None
+                and now - _local_last_used >= idle_unload_seconds
+            ):
+                _local_model = None
+                _local_model_name = None
+            if _local_model is None or _local_model_name != model_name:
+                logger.info("Loading faster-whisper model '%s' (first load downloads the model)...", model_name)
+                _local_model = _load_local_whisper_model(model_name)
+                _local_model_name = model_name
+            model = _local_model
+            _local_active_inferences += 1
+            reserved_inference = True
 
         # Language: config.yaml (stt.local.language) > env var > auto-detect.
         _forced_lang = (
@@ -1157,29 +1257,36 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
 
-        try:
-            segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
-            transcript = " ".join(segment.text.strip() for segment in segments)
-        except Exception as exc:
-            # CUDA runtime libs sometimes only fail at dlopen-on-first-use,
-            # AFTER the model loaded successfully.  Evict the broken cached
-            # model, reload on CPU, retry once.  Without this the module-
-            # global `_local_model` is poisoned and every subsequent voice
-            # message on this process fails identically until restart.
-            if not _looks_like_cuda_lib_error(exc):
-                raise
-            logger.warning(
-                "faster-whisper CUDA runtime failed mid-transcribe (%s) — "
-                "evicting cached model and retrying on CPU (int8).",
-                exc,
-            )
-            _local_model = None
-            _local_model_name = None
-            from faster_whisper import WhisperModel
-            _local_model = WhisperModel(model_name, device="cpu", compute_type="int8")
-            _local_model_name = model_name
-            segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
-            transcript = " ".join(segment.text.strip() for segment in segments)
+        with _local_inference_semaphore(max_concurrency):
+            try:
+                segments, info = model.transcribe(file_path, **transcribe_kwargs)
+                transcript = " ".join(segment.text.strip() for segment in segments)
+            except Exception as exc:
+                # CUDA runtime libs may fail only at first inference. Serialize
+                # eviction/replacement so no other caller races the fallback.
+                if not _looks_like_cuda_lib_error(exc):
+                    raise
+                logger.warning(
+                    "faster-whisper CUDA runtime failed mid-transcribe (%s) — "
+                    "evicting cached model and retrying on CPU (int8).",
+                    exc,
+                )
+                with _local_lifecycle_lock:
+                    if _local_model is model or _local_model_name != model_name:
+                        from faster_whisper import WhisperModel
+                        _local_model = WhisperModel(
+                            model_name, device="cpu", compute_type="int8"
+                        )
+                        _local_model_name = model_name
+                    model = _local_model
+                segments, info = model.transcribe(file_path, **transcribe_kwargs)
+                transcript = " ".join(segment.text.strip() for segment in segments)
+
+        with _local_lifecycle_condition:
+            _local_active_inferences -= 1
+            _local_last_used = _monotonic()
+            reserved_inference = False
+            _local_lifecycle_condition.notify_all()
 
         logger.info(
             "Transcribed %s via local whisper (%s, lang=%s, %.1fs audio)",
@@ -1189,6 +1296,11 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
         return {"success": True, "transcript": transcript, "provider": "local"}
 
     except Exception as e:
+        if reserved_inference:
+            with _local_lifecycle_condition:
+                _local_active_inferences -= 1
+                _local_last_used = _monotonic()
+                _local_lifecycle_condition.notify_all()
         logger.error("Local transcription failed: %s", e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"Local transcription failed: {e}"}
 
@@ -1749,6 +1861,44 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         model_name = _normalize_local_model(
             model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
         )
+        backend = str(local_cfg.get("backend") or "in_process").strip().lower()
+        if backend == "sidecar":
+            from tools.local_stt_client import transcribe_via_sidecar
+
+            token_file = str(local_cfg.get("sidecar_token_file") or "").strip()
+            if not token_file:
+                sidecar_result = {
+                    "success": False,
+                    "transcript": "",
+                    "error": "stt.local.sidecar_token_file is required for sidecar backend",
+                }
+            else:
+                try:
+                    timeout = float(local_cfg.get("sidecar_timeout_seconds", 30))
+                except (TypeError, ValueError):
+                    timeout = 30.0
+                sidecar_result = transcribe_via_sidecar(
+                    file_path,
+                    model_name,
+                    url=str(local_cfg.get("sidecar_url") or "http://127.0.0.1:8765"),
+                    token_file=token_file,
+                    timeout=max(timeout, 0.1),
+                )
+            fallback = is_truthy_value(
+                local_cfg.get("fallback_to_in_process", True), default=True
+            )
+            if sidecar_result.get("success") or not fallback:
+                return sidecar_result
+            logger.warning(
+                "Shared local STT sidecar failed (%s); falling back to in-process STT",
+                sidecar_result.get("error", "unknown error"),
+            )
+        elif backend != "in_process":
+            return {
+                "success": False,
+                "transcript": "",
+                "error": f"Unsupported stt.local.backend: {backend}",
+            }
         return _transcribe_local(file_path, model_name)
 
     if provider == "local_command":

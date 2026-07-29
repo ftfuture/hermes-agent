@@ -9,6 +9,7 @@ import os
 import sys
 import struct
 import subprocess
+import threading
 import types
 import wave
 from unittest.mock import MagicMock, patch
@@ -435,6 +436,235 @@ class TestTranscribeLocalCommand:
     reason="faster_whisper not installed",
 )
 class TestTranscribeLocalExtended:
+    def test_concurrent_calls_load_model_once(self, tmp_path):
+        audio = tmp_path / "test.ogg"
+        audio.write_bytes(b"fake")
+        entered_loader = threading.Event()
+        release_loader = threading.Event()
+        model = MagicMock()
+        info = MagicMock(language="en", duration=1.0)
+        model.transcribe.return_value = ([], info)
+        load_count = 0
+
+        def load_model(_name):
+            nonlocal load_count
+            load_count += 1
+            entered_loader.set()
+            release_loader.wait(timeout=2)
+            return model
+
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._load_local_whisper_model", side_effect=load_model), \
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None):
+            from tools.transcription_tools import _transcribe_local
+            first = threading.Thread(target=_transcribe_local, args=(str(audio), "base"))
+            second = threading.Thread(target=_transcribe_local, args=(str(audio), "base"))
+            first.start()
+            assert entered_loader.wait(timeout=2)
+            second.start()
+            release_loader.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        assert not first.is_alive() and not second.is_alive()
+        assert load_count == 1
+
+    @pytest.mark.parametrize(
+        ("local_config", "expected"),
+        [
+            ({"idle_unload_seconds": "30.5", "max_concurrency": "2"}, (30.5, 2)),
+            ({"idle_unload_seconds": "invalid", "max_concurrency": "0"}, (600, 1)),
+        ],
+    )
+    def test_local_runtime_settings_accept_strings_and_use_safe_defaults(
+        self, local_config, expected
+    ):
+        with patch(
+            "tools.transcription_tools._load_stt_config",
+            return_value={"local": local_config},
+        ):
+            from tools.transcription_tools import _local_runtime_settings
+            assert _local_runtime_settings() == expected
+
+    def test_default_inference_concurrency_is_one(self, tmp_path):
+        audio = tmp_path / "test.ogg"
+        audio.write_bytes(b"fake")
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        calls = 0
+        info = MagicMock(language="en", duration=1.0)
+        model = MagicMock()
+
+        def transcribe(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_entered.set()
+                release_first.wait(timeout=2)
+            else:
+                second_entered.set()
+            return [], info
+
+        model.transcribe.side_effect = transcribe
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"local": {}}), \
+             patch("tools.transcription_tools._monotonic", return_value=100.0), \
+             patch("tools.transcription_tools._load_local_whisper_model", return_value=model), \
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._local_last_used", None), \
+             patch("tools.transcription_tools._local_inference_semaphores", {}):
+            from tools.transcription_tools import _transcribe_local
+            first = threading.Thread(target=_transcribe_local, args=(str(audio), "base"))
+            second = threading.Thread(target=_transcribe_local, args=(str(audio), "base"))
+            first.start()
+            assert first_entered.wait(timeout=2)
+            second.start()
+            assert not second_entered.wait(timeout=0.1)
+            release_first.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        assert second_entered.is_set()
+        assert calls == 2
+
+    def test_idle_model_unloads_using_string_config_and_monotonic_clock(self, tmp_path):
+        audio = tmp_path / "test.ogg"
+        audio.write_bytes(b"fake")
+        info = MagicMock(language="en", duration=1.0)
+        models = [MagicMock(), MagicMock()]
+        for model in models:
+            model.transcribe.return_value = ([], info)
+        clock = iter([100.0, 100.0, 701.0, 701.0])
+
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value={
+                 "local": {"idle_unload_seconds": "600", "max_concurrency": "1"}
+             }), \
+             patch("tools.transcription_tools._monotonic", side_effect=lambda: next(clock)), \
+             patch("tools.transcription_tools._load_local_whisper_model", side_effect=models) as loader, \
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._local_last_used", None):
+            from tools.transcription_tools import _transcribe_local
+            _transcribe_local(str(audio), "base")
+            _transcribe_local(str(audio), "base")
+
+        assert loader.call_count == 2
+
+    def test_active_inference_is_not_evicted_after_idle_threshold(self, tmp_path):
+        audio = tmp_path / "test.ogg"
+        audio.write_bytes(b"fake")
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        release = threading.Event()
+        calls = 0
+        now = [100.0]
+        info = MagicMock(language="en", duration=1.0)
+        model = MagicMock()
+
+        def transcribe(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            (first_entered if calls == 1 else second_entered).set()
+            release.wait(timeout=2)
+            return [], info
+
+        model.transcribe.side_effect = transcribe
+        replacement = MagicMock()
+        replacement.transcribe.return_value = ([], info)
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("tools.transcription_tools._load_stt_config", return_value={
+                 "local": {"idle_unload_seconds": 10, "max_concurrency": 2}
+             }), \
+             patch("tools.transcription_tools._monotonic", side_effect=lambda: now[0]), \
+             patch("tools.transcription_tools._load_local_whisper_model", side_effect=[model, replacement]) as loader, \
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._local_last_used", None), \
+             patch("tools.transcription_tools._local_inference_semaphores", {}):
+            from tools import transcription_tools as module
+            first = threading.Thread(target=module._transcribe_local, args=(str(audio), "base"))
+            first.start()
+            assert first_entered.wait(timeout=2)
+            now[0] = 111.0
+            second = threading.Thread(target=module._transcribe_local, args=(str(audio), "base"))
+            second.start()
+            assert second_entered.wait(timeout=2)
+            release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+            assert module._local_last_used == 111.0
+
+        assert loader.call_count == 1
+        assert model.transcribe.call_count == 2
+        replacement.transcribe.assert_not_called()
+
+    def test_cleanup_local_stt_is_idempotent_and_closes_dll_handles(self):
+        handle = MagicMock()
+        handles = [handle]
+        directories = {"cuda"}
+        with patch("tools.transcription_tools._local_model", object()), \
+             patch("tools.transcription_tools._local_model_name", "base"), \
+             patch("tools.transcription_tools._cuda_dll_directory_handles", handles), \
+             patch("tools.transcription_tools._cuda_dll_directories", directories):
+            from tools import transcription_tools as module
+            module.cleanup_local_stt()
+            module.cleanup_local_stt()
+            assert module._local_model is None
+            assert module._local_model_name is None
+
+        handle.close.assert_called_once_with()
+        assert handles == []
+        assert directories == set()
+
+    def test_windows_cuda_dll_dirs_are_deduplicated_case_insensitively(self, tmp_path):
+        cuda_dir = tmp_path / "Cuda-Bin"
+        cuda_dir.mkdir()
+        handles = []
+
+        with patch("tools.transcription_tools.os.name", "nt"), \
+             patch("tools.transcription_tools.Path.is_dir", return_value=True), \
+             patch("tools.transcription_tools._load_stt_config", return_value={
+                 "local": {"cuda_dll_dirs": [str(cuda_dir), str(cuda_dir).upper()]}
+             }), \
+             patch("tools.transcription_tools.os.add_dll_directory", side_effect=lambda path: object(), create=True) as add_dir, \
+             patch("tools.transcription_tools._cuda_dll_directory_handles", handles), \
+             patch("tools.transcription_tools._cuda_dll_directories", set()):
+            from tools.transcription_tools import _configure_windows_cuda_dll_dirs
+            _configure_windows_cuda_dll_dirs()
+            _configure_windows_cuda_dll_dirs()
+
+        assert add_dir.call_count == 1
+        assert len(handles) == 1
+
+    def test_windows_cuda_dll_dirs_are_registered_and_retained(self, tmp_path):
+        """Configured CUDA DLL directories stay active for delayed CTranslate2 loads."""
+        cuda_dir = tmp_path / "cuda-bin"
+        cuda_dir.mkdir()
+        handle = object()
+
+        with patch(
+            "tools.transcription_tools._load_stt_config",
+            return_value={"local": {"cuda_dll_dirs": (
+                '["' + str(cuda_dir).replace('\\', '\\\\') + '", "' +
+                str(tmp_path / "missing").replace('\\', '\\\\') + '"]'
+            )}}
+        ), patch(
+            "tools.transcription_tools.os.add_dll_directory",
+            return_value=handle,
+            create=True,
+        ) as add_dir, patch(
+            "tools.transcription_tools._cuda_dll_directory_handles", []
+        ) as handles:
+            from tools.transcription_tools import _configure_windows_cuda_dll_dirs
+            _configure_windows_cuda_dll_dirs()
+
+        add_dir.assert_called_once_with(str(cuda_dir))
+        assert handles == [handle]
+
     def test_model_reuse_on_second_call(self, tmp_path):
         """Second call with same model should NOT reload the model."""
         audio = tmp_path / "test.ogg"
