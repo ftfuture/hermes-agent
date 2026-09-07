@@ -273,13 +273,24 @@ class SSHEnvironment(BaseEnvironment):
             # Detach the pipe we just closed.  `communicate()` below drains
             # tar's stderr, and on Windows CPython starts one reader thread per
             # non-None stream without checking whether it is closed
-            # (`subprocess.py::_readerthread` -> `fh.read()`).  That raises
-            # `ValueError: read of closed file` and kills every terminal
-            # command the SSH backend tries to run.  The POSIX branch guards
-            # with `not self.stdout.closed`, which is why this never surfaced
-            # on macOS or Linux.  Measured on SSJOON 2026-09-07: the exception
-            # repeated on each command until the run gave up.  Upstream still
-            # has the same shape (NousResearch/hermes-agent ssh.py:216-221).
+            # (`subprocess.py::_readerthread` -> `fh.read()`), which raises
+            # `ValueError: read of closed file` inside that thread.  The POSIX
+            # branch guards with `not self.stdout.closed` (subprocess.py
+            # 2100-2103 in CPython 3.11); the Windows branch (1606) has no
+            # such check.  That is why this never surfaced on macOS or Linux.
+            #
+            # Scope of the damage, measured on SSJOON 2026-09-07 and
+            # independently re-measured under review: the exception does NOT
+            # reach the caller.  It kills only the reader thread, and the
+            # upload itself still succeeds (tar exits 0).  What it does is
+            # print a traceback on every bulk upload and leave a dead thread
+            # behind.  An earlier version of this comment said it killed every
+            # terminal command the SSH backend runs; that was inferred from
+            # the repeated tracebacks in a stalled run and measurement does
+            # not support it.  Whether those stalls have another cause is open.
+            #
+            # Upstream still has the same shape
+            # (NousResearch/hermes-agent ssh.py:216-221).
             tar_proc.stdout = None
 
             try:
