@@ -270,6 +270,17 @@ class SSHEnvironment(BaseEnvironment):
 
             # Allow tar_proc to receive SIGPIPE if ssh_proc exits early
             tar_proc.stdout.close()
+            # Detach the pipe we just closed.  `communicate()` below drains
+            # tar's stderr, and on Windows CPython starts one reader thread per
+            # non-None stream without checking whether it is closed
+            # (`subprocess.py::_readerthread` -> `fh.read()`).  That raises
+            # `ValueError: read of closed file` and kills every terminal
+            # command the SSH backend tries to run.  The POSIX branch guards
+            # with `not self.stdout.closed`, which is why this never surfaced
+            # on macOS or Linux.  Measured on SSJOON 2026-09-07: the exception
+            # repeated on each command until the run gave up.  Upstream still
+            # has the same shape (NousResearch/hermes-agent ssh.py:216-221).
+            tar_proc.stdout = None
 
             try:
                 _, ssh_stderr = ssh_proc.communicate(timeout=120)

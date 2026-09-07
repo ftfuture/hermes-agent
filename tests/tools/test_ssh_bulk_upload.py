@@ -550,3 +550,59 @@ class TestSSHBulkUploadEdgeCases:
 
         mock_tar.kill.assert_called_once()
         mock_tar.wait.assert_called_once()
+
+
+class TestSSHBulkUploadWindowsPipes:
+    """Regression: the tar stdout pipe must be detached before communicate().
+
+    On Windows CPython starts one reader thread per non-None stream in
+    `communicate()` without checking whether it is closed
+    (`subprocess.py::_readerthread` -> `fh.read()`), so calling it after
+    `tar_proc.stdout.close()` raises `ValueError: read of closed file`.
+    The POSIX branch guards with `not self.stdout.closed`, which is why this
+    only ever broke on Windows -- every terminal command through the SSH
+    backend died there while macOS and Linux were fine.
+
+    The other tests in this file use plain MagicMock pipes, so a closed
+    stdout is invisible to them.  This one models the close and makes
+    communicate() fail the way CPython does.
+    """
+
+    def test_tar_stdout_is_detached_before_communicate(self, mock_env, tmp_path):
+        f1 = tmp_path / "a.txt"
+        f1.write_text("aaa")
+
+        def _windows_like_proc():
+            m = MagicMock()
+            m.returncode = 0
+            m.poll.return_value = None
+            m.stderr = MagicMock()
+            m.stderr.read.return_value = b""
+            stdout = MagicMock()
+            stdout.closed = False
+            stdout.close.side_effect = lambda: setattr(stdout, "closed", True)
+            m.stdout = stdout
+
+            def _communicate(*_args, **_kwargs):
+                # What CPython's Windows branch does: one reader thread per
+                # non-None stream, no `.closed` check.
+                if m.stdout is not None and m.stdout.closed:
+                    raise ValueError("read of closed file")
+                return (b"", b"")
+
+            m.communicate.side_effect = _communicate
+            return m
+
+        tar_proc = _windows_like_proc()
+        ssh_proc = _windows_like_proc()
+        ssh_proc.poll.return_value = 0
+
+        mock_run = MagicMock(return_value=subprocess.CompletedProcess([], 0))
+        with patch.object(subprocess, "run", mock_run), \
+             patch.object(subprocess, "Popen", side_effect=[tar_proc, ssh_proc]):
+            mock_env._ssh_bulk_upload([(str(f1), "/home/testuser/.hermes/skills/a.txt")])
+
+        assert tar_proc.stdout is None, (
+            "tar stdout must be detached after close(); leaving it set makes "
+            "communicate() raise ValueError on Windows"
+        )
