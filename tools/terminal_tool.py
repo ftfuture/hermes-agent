@@ -1292,17 +1292,31 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
     sandbox (e.g. ``/workspace`` or ``/root``). A host path (``/home/user``,
     ``C:\\Users\\me``) or a relative path (``.``, ``src/``) is meaningless to
     ``docker run -w`` and makes the container fail to start (exit 125).
+
+    The verdict must not depend on the OS Hermes happens to run on.  It used
+    to: the relative-path check called ``os.path.isabs``, whose answer for the
+    same string differs between hosts, and the comment above it assumed a
+    POSIX host ("Windows drive paths ... are already caught by the prefix
+    check").  On a Windows host they were not, because ``_HOST_CWD_PREFIXES``
+    lists only the ``C:`` drive.  Measured on SSJOON 2026-09-07 (Windows,
+    CPython 3.11.15): ``D:\\hermes\\kanban``, ``D:/hermes`` and ``Z:\\x`` all
+    passed this guard and reached the container builder.
+
+    The same coupling had a second edge waiting.  ``ntpath.isabs`` changed in
+    CPython 3.13 to return False for a rooted path with no drive, so on a
+    Windows host running 3.13+ this guard would have started rejecting
+    ``/workspace`` and ``/root`` -- discarding the very values it exists to
+    let through.  SSJOON is on 3.11 today, so that edge has not fired yet.
+
+    Both go away with the rule the sandbox actually imposes: a container cwd
+    must be an absolute POSIX path.  ``C:/x`` and ``D:\\x`` are not, on any
+    host, and neither is ``.`` or ``src/``.
     """
     if not cwd:
         return False
     if any(cwd.startswith(p) for p in _HOST_CWD_PREFIXES):
         return True
-    # Relative paths (".", "src/") can't be a container workdir either. Windows
-    # drive paths are absolute on Windows but os.path.isabs() is False on a
-    # POSIX host, so they're already caught by the prefix check above.
-    if not os.path.isabs(cwd):
-        return True
-    return False
+    return not cwd.startswith("/")
 
 
 # One-shot guard for the config-fallback bridge below.  Purely an
