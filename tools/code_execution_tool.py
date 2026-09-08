@@ -714,8 +714,11 @@ def _get_or_create_env(task_id: str):
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,
         _get_env_config, _last_activity, _start_cleanup_thread,
-        _creation_locks, _creation_locks_lock, _task_env_overrides,
+        _creation_locks, _creation_locks_lock,
         _resolve_container_task_id,
+        resolve_task_overrides,
+        _is_unusable_container_cwd,
+        _CONTAINER_BACKENDS,
     )
 
     effective_task_id = _resolve_container_task_id(task_id)
@@ -740,7 +743,14 @@ def _get_or_create_env(task_id: str):
 
         config = _get_env_config()
         env_type = config["env_type"]
-        overrides = _task_env_overrides.get(effective_task_id, {})
+        # Raw key first, then the collapsed container id -- the same lookup
+        # the terminal and file layers use. This site read only the collapsed
+        # id, so a CWD-only override (registered by ACP/gateway/TUI under the
+        # raw session id, and deliberately collapsed for container sharing)
+        # was silently dropped here while the other two layers honoured it.
+        # resolve_task_overrides() exists precisely so those layers cannot
+        # drift apart; this file was the drift.
+        overrides = resolve_task_overrides(task_id)
 
         if env_type == "docker":
             image = overrides.get("docker_image") or config["docker_image"]
@@ -754,6 +764,24 @@ def _get_or_create_env(task_id: str):
             image = ""
 
         cwd = overrides.get("cwd") or config["cwd"]
+        if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+            # This site had no cwd guard at all. It looked safe only because
+            # the lookup above missed CWD-only overrides; now that it finds
+            # them, the guard the other layers already run has to run here
+            # too. Without it a host path reaches `docker run -w <host path>`
+            # and the container fails to start (exit 125).
+            #
+            # It was never fully safe even before: an override carrying an
+            # isolation key (env_type or *_image, as RL and benchmark
+            # harnesses register) keeps the raw id, so the host path came
+            # through on exactly the rollouts that need their own sandbox.
+            if cwd != config["cwd"]:
+                logger.info(
+                    "Ignoring host/relative cwd override %r for %s backend "
+                    "(won't exist in sandbox). Using %r instead.",
+                    cwd, env_type, config["cwd"],
+                )
+            cwd = config["cwd"]
 
         container_config = None
         if env_type in {"docker", "singularity", "modal", "daytona"}:
